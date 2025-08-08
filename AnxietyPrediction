@@ -1,5 +1,4 @@
 # ** PROGRAM FOR PREDICTING NEW DATA **
-# prompt: Susun kembali program baru berbasis interface web hanya untuk proses Prediksi Data Baru  dengan menggunakan model yang telah disimpan saja dari program diatas.
 
 import pandas as pd
 import numpy as np
