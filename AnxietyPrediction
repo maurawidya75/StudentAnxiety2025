@@ -1,0 +1,217 @@
+# ** PROGRAM FOR PREDICTING NEW DATA **
+# prompt: Susun kembali program baru berbasis interface web hanya untuk proses Prediksi Data Baru  dengan menggunakan model yang telah disimpan saja dari program diatas.
+
+import pandas as pd
+import numpy as np
+import io
+import base64
+import matplotlib.pyplot as plt
+import seaborn as sns
+import traceback
+import joblib
+import gradio as gr
+
+# Load necessary components (model, scaler, imputer, label encoder)
+global_model = joblib.load('naive_bayes_model.joblib')
+global_scaler = joblib.load('minmax_scaler.joblib')
+global_imputer = joblib.load('simple_imputer.joblib')
+global_label_encoder = joblib.load('label_encoder.joblib')
+
+# Assuming feature columns were derived from the training data and are needed for prediction
+# This is a placeholder; in a real-world scenario, you might save/load this list as well.
+# For now, let's assume they are K1 to K20.
+global_feature_cols = [f'K{i}' for i in range(1, 21)]
+
+# Define the mapping used in the training phase
+mapping = {
+    "Tidak sama sekali": 0, "Sedikit": 1, "Agak": 2, "Sangat": 3
+}
+
+# Function to predict new data
+def prediksi_data_baru(k1, k2, k3, k4, k5, k6, k7, k8, k9, k10,
+                       k11, k12, k13, k14, k15, k16, k17, k18, k19, k20):
+    global global_model, global_imputer, global_scaler, global_feature_cols, global_label_encoder, mapping
+
+    # Check if all inputs are filled (not None)
+    input_values_list = [k1, k2, k3, k4, k5, k6, k7, k8, k9, k10,
+                         k11, k12, k13, k14, k15, k16, k17, k18, k19, k20]
+    if None in input_values_list:
+        error_message = "Data wajib diisi semua. Mohon lengkapi semua jawaban kuesioner."
+        return f"<p style='color:red;'>{error_message}</p>", error_message, "N/A", "N/A", "N/A"
+
+    # Ensure model and preprocessing components are available
+    if global_model is None or global_imputer is None or global_scaler is None or global_feature_cols is None or not global_feature_cols or global_label_encoder is None:
+        return "Model atau komponen pra-pemrosesan belum siap. Pastikan file model, scaler, imputer, dan encoder tersedia.", "Error: Model or preprocessing components not ready.", None, None, None
+
+    try:
+        # Create DataFrame from new input
+        input_values = {
+            'K1': k1, 'K2': k2, 'K3': k3, 'K4': k4, 'K5': k5,
+            'K6': k6, 'K7': k7, 'K8': k8, 'K9': k9, 'K10': k10,
+            'K11': k11, 'K12': k12, 'K13': k13, 'K14': k14, 'K15': k15,
+            'K16': k16, 'K17': k17, 'K18': k18, 'K19': k19, 'K20': k20
+        }
+        new_df = pd.DataFrame([input_values])
+
+        # Ensure the DataFrame has the same column order as the features used in training
+        if not all(col in new_df.columns for col in global_feature_cols):
+             return "Error: Kolom input tidak sesuai dengan kolom fitur yang dilatih.", "Error: Input columns mismatch.", None, None, None
+        # Select and reorder columns to match global_feature_cols
+        new_df_processed = new_df[global_feature_cols].copy()
+
+
+        # --- Apply preprocessing steps used during training ---
+
+        # 1. Convert categorical values using the mapping
+        cols_to_convert = new_df_processed.select_dtypes(exclude=np.number).columns.tolist()
+        for col in cols_to_convert:
+             if col in new_df_processed.columns:
+                 # Apply map, then convert to numeric (coercing errors)
+                 new_df_processed[col] = new_df_processed[col].map(mapping)
+                 new_df_processed[col] = pd.to_numeric(new_df_processed[col], errors='coerce')
+
+
+        # 2. Impute missing values (NaNs) using the *fitted* global_imputer
+        # The imputer needs to be applied to the DataFrame section that matches the original training features
+        # new_df_processed now contains the potential NaNs after mapping
+        new_df_imputed_array = global_imputer.transform(new_df_processed[global_feature_cols])
+        new_df_imputed = pd.DataFrame(new_df_imputed_array, columns=global_feature_cols, index=new_df_processed.index)
+
+
+        # 3. Scale the data using the *fitted* global_scaler
+        new_df_scaled_array = global_scaler.transform(new_df_imputed)
+        new_df_scaled = pd.DataFrame(new_df_scaled_array, columns=global_feature_cols, index=new_df_imputed.index)
+
+        if new_df_scaled.empty or new_df_scaled.shape[1] != len(global_feature_cols):
+            return "Error: Data baru yang diproses dan terskala tidak sesuai dengan format fitur yang diharapkan untuk prediksi.", "Error: Processed new data format mismatch.", None, None, None
+
+        # Make prediction on the SCALED data
+        predictions_encoded = global_model.predict(new_df_scaled)
+
+        # Get probability estimates for the classes on the SCALED data
+        prediction_proba = global_model.predict_proba(new_df_scaled)
+
+        # Decode the prediction back to the original string label
+        predicted_label = "N/A"
+        posterior_probs_str = "Tidak dapat menghitung probabilitas posterior."
+        prediction_category = "N/A"
+
+        if len(predictions_encoded) > 0:
+             encoded_prediction = predictions_encoded[0]
+             if global_label_encoder and hasattr(global_label_encoder, 'classes_'):
+                  if 0 <= int(encoded_prediction) < len(global_label_encoder.classes_):
+                      predicted_label = global_label_encoder.inverse_transform([encoded_prediction])[0]
+                      prediction_category = predicted_label
+                  else:
+                      predicted_label = f"Unknown_Encoded_{encoded_prediction}"
+                      prediction_category = "Unknown (Encoded Value)"
+             else:
+                  predicted_label = str(encoded_prediction)
+                  prediction_category = f"Encoded Numeric ({predicted_label})"
+
+
+             # Format posterior probabilities
+             if prediction_proba.shape[0] > 0 and global_model.classes_ is not None and prediction_proba.shape[1] == len(global_model.classes_):
+                 posterior_probs = prediction_proba[0]
+                 prob_labels = global_label_encoder.classes_.tolist() if global_label_encoder and hasattr(global_label_encoder, 'classes_') else [str(int(c)) for c in global_model.classes_]
+
+                 if len(prob_labels) == len(posterior_probs):
+                     prob_dict = dict(zip(prob_labels, posterior_probs))
+                     sorted_probs = sorted(prob_dict.items(), key=lambda item: item[1], reverse=True)
+                     posterior_probs_str = ", ".join([f"{label}: {prob:.4f}" for label, prob in sorted_probs])
+                 else:
+                     posterior_probs_str = "Jumlah probabilitas tidak cocok dengan jumlah kelas."
+             else:
+                  posterior_probs_str = "Probabilitas posterior tidak tersedia atau format tidak sesuai."
+
+
+        # Create a combined result DataFrame for display (including original input and prediction/probabilities)
+        result_df_display = new_df.copy() # Use the dataframe with original input values
+        result_df_display['Label Prediksi'] = predicted_label
+        result_df_display['Kategori Hasil'] = prediction_category
+        result_df_display['Probabilitas Posterior'] = posterior_probs_str
+
+
+        def df_to_html(df, caption=None):
+            if df is None or df.empty:
+                return "<p>Tidak ada data untuk ditampilkan.</p>"
+            html = df.to_html(index=False)
+            if caption:
+                html = f"<caption>{caption}</caption>" + html
+            return html
+
+
+        # Display the new data with predictions
+        html_output = df_to_html(result_df_display, caption="Hasil Prediksi Data Baru")
+
+        return html_output, "Prediksi selesai.", predicted_label, prediction_category, posterior_probs_str
+
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error memprediksi data baru: {e}", f"Error: {e}", None, None, None
+
+
+# Interface for predicting new data
+with gr.Blocks() as interface_prediksi_baru:
+    gr.Markdown("<h2>Prediksi Data Baru</h2>")
+    gr.Markdown("Isikan jawaban Anda untuk pertanyaan Kuesioner 1 (K1) hingga Kuesioner 20 (K20) menggunakan tombol pilihan berikut:")
+    gr.Markdown("Pilih salah satu dari opsi ini untuk setiap kuesioner:")
+    gr.Markdown("<ul><li>Tidak sama sekali</li><li>Sedikit</li><li>Agak</li><li>Sangat</li></ul>")
+
+    # Create radio button inputs for K1 to K20
+    input_k_list = []
+    choices = ["Tidak sama sekali", "Sedikit", "Agak", "Sangat"]
+    questions = {
+        'K1': 'Apakah anda ada perasaan gelisah atau tegang sebelum UAS ?',
+        'K2': 'Apakah anda merasa gugup atau khawatir setiap menghadapi UAS ?',
+        'K3': 'Apakah anda biasanya sulit untuk tenang atau rileks pada saat sebelum dan sesudah UAS ?',
+        'K4': 'Apakah sebelum UAS berlangsung kesulitan untuk tidur atau tidur terasa terganggu, sebelum UAS ?',
+        'K5': 'Apakah anda sangat cemas tentang masa depan, jika anda mengalami kegagalan dalam mengerjakan UAS ?',
+        'K6': 'Apakah anda sangat mudah tersinggung atau marah jika gagal dalam menyelesaikan soal UAS ?',
+        'K7': 'Apakah anda merasa tidak mampu untuk berkonsentrasi atau memusatkan perhatian pada saat mengerjakan soal UAS ?',
+        'K8': 'Apakah anda tidak bisa menenangkan diri sendiri, jika pada saat UAS ada permasalahan yang mengganggu pikiran anda ?',
+        'K9': 'Apakah anda memiliki perasaan cemas yang konstan atau berlebihan pada saat anda tidak siap dengan UAS ?',
+        'K10': 'Apakah tubuh anda terasa tegang atau kaku, pada saat sebelum ataupun saat mengerjakan UAS?',
+        'K11': 'Apakah adanda merasa khawatir tentang berbagai hal yang mungkin terjadi, jika anda gagal tidak mengikuti UAS atau merasa hasil yang dikerjakan tidak dapat diselesaikan ?',
+        'K12': 'Apakah anda merasa cemas atau takut tanpa alasan yang jelas, sebelum ataupun menjelang UAS?',
+        'K13': 'Apakah anda merasa sulit untuk menenangkan pikiran, jika ada hal yang mengganggu pikiran dan perasaan pada saat mengerjakan UAS ?',
+        'K14': 'Apakah anda merasa takut akan hal-hal yang tidak anda mengerti, pada saat mengerjakan soal tidak seperti yang dipelajari ?',
+        'K15': 'Apakah anda tergolong tipe sulit untuk mengekspresikan perasaan anda sendiri didepan orang?',
+        'K16': 'Apakah anda merasa sulit untuk bertindak tegas atau membuat keputusan saat menghadapi UAS?',
+        'K17': 'Apakah anda khawatir berlebihan tentang detail kecil sebelum UAS?',
+        'K18': 'Apakah anda cenderung menghindari situasi yang memicu kecemasan sebelum UAS?',
+        'K19': 'Apakah anda sering merasa jantung berdebar atau sesak napas sebelum UAS?',
+        'K20': 'Apakah anda merasa lelah atau kehabisan energi karena khawatir tentang UAS?'
+    }
+
+    # Use a vertical column to group the inputs
+    with gr.Column():
+        # Create inputs dynamically based on feature columns (assuming K1-K20)
+        pred_input_cols = global_feature_cols
+        for col in pred_input_cols:
+            question_text = questions.get(col, f'Pertanyaan {col}')
+            input_k_list.append(gr.Radio(label=f"{col}: {question_text}", choices=choices, value=None, interactive=True))
+
+    prediksi_btn = gr.Button("Lakukan Prediksi")
+    output_prediksi_data_baru = gr.HTML(label="Hasil Prediksi Data Baru")
+    output_prediksi_error = gr.Textbox(label="Error Info", interactive=False)
+    output_predicted_label = gr.Textbox(label="Label Prediksi", interactive=False)
+    output_predicted_category = gr.Textbox(label="Kategori Hasil", interactive=False)
+    output_predicted_probs = gr.Textbox(label="Probabilitas Posterior per Kategori", interactive=False)
+
+
+    prediksi_btn.click(
+        fn=prediksi_data_baru,
+        inputs=input_k_list,
+        outputs=[output_prediksi_data_baru, output_prediksi_error, output_predicted_label, output_predicted_category, output_predicted_probs]
+    )
+
+# Combine the single interface using Blocks
+with gr.Blocks() as demo:
+    gr.Markdown("<h1>Aplikasi Prediksi Tingkat Kecemasan Mahasiswa menghadapi Ujian dengan Naive Bayes dan Clustering (Prediksi Saja)</h1>")
+    gr.Markdown("Aplikasi ini memungkinkan Anda memasukkan data baru dan memprediksi tingkat kecemasan menggunakan model yang telah dilatih.")
+
+    interface_prediksi_baru.render()
+
+# Launch the demo
+demo.launch(share=True, debug=False)
