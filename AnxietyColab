@@ -1,0 +1,1098 @@
+#Files run in Google Colab
+
+#Library Installation
+!pip install gradio --quiet
+!pip install --upgrade gspread gspread_dataframe openpyxl
+!pip install --upgrade gspread gspread_dataframe openpyxl scikit-learn
+!pip install --upgrade gspread gspread_dataframe openpyxl scikit-learn kmodes
+# Install necessary libraries if not already installed, ensuring compatible versions
+!pip install --quiet gspread gspread-dataframe matplotlib pandas seaborn gradio joblib openpyxl kmodes
+!pip install --quiet scikit-learn imbalanced-learn --upgrade # Install/upgrade scikit-learn and imbalanced-learn together
+!pip install imbalanced-learn --quiet
+
+#FIRST PROCESS OF CLUSTERING, NAIVE BAYES, MODEL TESTING AND PREDICTION
+#Library
+import pandas as pd
+import numpy as np
+import io
+import base64
+import matplotlib.pyplot as plt
+import seaborn as sns # Added for better plot aesthetics
+import traceback
+import joblib # For saving/loading model and scaler
+
+from google.colab import auth
+import gspread
+from google.auth import default
+from gspread_dataframe import get_as_dataframe, set_with_dataframe
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import GaussianNB
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import LabelEncoder
+
+import gradio as gr
+
+# Autentikasi dan otorisasi gspread
+auth.authenticate_user()
+creds, _ = default()
+gc = gspread.authorize(creds)
+
+# Variabel global untuk menyimpan data dan komponen model
+global_df = None  # Kerangka data asli dari Google Sheet
+global_df_processed = None # Kerangka data setelah menghapus kolom pribadi dan mengganti nama K1..K20
+global_df_numeric = None # Kerangka data setelah mengubah jawaban teks menjadi angka
+global_df_imputed = None  # Kerangka data setelah imputasi
+global_df_clustered = None  # Kerangka data setelah pengelompokan (termasuk kolom Cluster dan Cluster_Label)
+
+global_feature_cols = None # Daftar nama kolom fitur (misalnya, ['K1', 'K2', ...])
+global_imputer = None # Imputer dipasang pada data fitur numerik
+global_scaler = None # Skaler dipasang pada data fitur numerik
+
+global_kmeans_model = None  # Model KMeans (disesuaikan pada data berskala)
+global_model = None  # Model Naive Bayes (disesuaikan pada data berskala dengan target Cluster_Label)
+global_label_encoder = None # Pengkode label untuk variabel target 'Cluster_Label'
+
+global_X_test_scaled = None # Fitur pengujian (berskala)
+global_y_test_encoded = None # Target pengujian (dikodekan)
+
+# Fungsi pembantu untuk menampilkan kerangka data sebagai tabel HTML
+def df_to_html(df, caption=None):
+    if df is None or df.empty:
+        return "<p>Tidak ada data untuk ditampilkan.</p>"
+    html = df.to_html(index=False)
+    if caption:
+        html = f"<caption>{caption}</caption>" + html
+    return html
+
+# Fungsi pembantu untuk menampilkan plot
+def plot_to_html(fig, caption=None, filename=None):
+    if fig is None:
+        return "" # Kembalikan string kosong jika tidak ada angka yang diberikan
+    try:
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png')
+        if filename:
+             fig.savefig(filename) # Simpan plot ke file
+        plt.close(fig)  # Tutup gambar untuk membebaskan memori
+        data = base64.b64encode(buf.getvalue()).decode('utf-8')
+        img_html = f'<img src="data:image/png;base64,{data}" alt="Plot">'
+        if caption:
+            return f"<figure>{img_html}<figcaption>{caption}</figcaption></figure>"
+        return img_html
+    except Exception as e:
+        traceback.print_exc()
+        return f"<p>Error menghasilkan plot: {e}</p>"
+
+# Fungsi pembantu untuk membuat diagram batang untuk rata-rata klaster
+def plot_cluster_means(cluster_means_df, caption="Rata-rata Fitur per Cluster"):
+    if cluster_means_df is None or cluster_means_df.empty:
+        return None, "Tidak ada data rata-rata kluster untuk plot."
+
+    try:
+        fig, axes = plt.subplots(nrows=cluster_means_df.shape[0], ncols=1, figsize=(10, 5 * cluster_means_df.shape[0]), sharey=True)
+        if cluster_means_df.shape[0] == 1: # Menangani kasus dengan hanya satu cluster
+             axes = [axes]
+
+        # Dapatkan nama fitur (tidak termasuk Cluster_Label jika ada)
+        feature_names = [col for col in cluster_means_df.columns if col != 'Cluster_Label']
+
+        for i, (index, row) in enumerate(cluster_means_df.iterrows()):
+            cluster_label = row.get('Cluster_Label', f'Kluster {index}')
+            ax = axes[i]
+            row[feature_names].plot(kind='bar', ax=ax)
+            ax.set_title(f'{caption}: {cluster_label}')
+            ax.set_ylabel('Nilai Rata-rata')
+            ax.tick_params(axis='x', rotation=45)
+
+        plt.tight_layout()
+
+        # Simpan plotnya
+        plot_filename = 'cluster_means_bar_plot.png'
+        fig.savefig(plot_filename)
+        save_status = f"Plot rata-rata kluster disimpan ke {plot_filename}"
+
+        return fig, save_status
+    except Exception as e:
+        traceback.print_exc()
+        # Cukup kembalikan None untuk gambar dan string pesan kesalahan
+        return None, f"Error menghasilkan plot rata-rata kluster: {e}"
+
+# --- Backend Functions ---
+
+# Fungsi backend untuk mengambil data dan menampilkannya sebagai tabel
+def ambil_data_dan_tampilkan_dan_drop():
+    global global_df, global_df_processed
+    try:
+        # PAstikann URL/ID spreadsheet Google Forms
+        spreadsheet = gc.open_by_url('https://docs.google.com/spreadsheets/d/1cAAr4V3WKw0qptG3C-D9PhtiMiN8kIFKA6xMvvU_WSs/edit?resourcekey&usp=forms_web_b&urp=linked#gid=1623122473')
+        worksheet = spreadsheet.sheet1
+        # Get data as a DataFrame
+        df = get_as_dataframe(worksheet)
+
+        if df.empty:
+             return "<p>Spreadsheet kosong atau tidak dapat membaca data.</p>", "Error: Spreadsheet kosong.", None # Return None for save status
+
+        # Nama kolom
+        df.columns = df.columns.str.replace('[^A-Za-z0-9_]+', '', regex=True)
+        # Simpan kerangka data asli dalam variabel global
+        global_df = df.copy()
+
+        # Tentukan kolom yang akan dihapus
+        cols_to_drop = ['Timestamp', 'Nama', 'ProdiNIM', 'Semester']
+        # Hapus kolom-kolom ini dari salinan yang diproses
+        cols_to_drop_existing = [col for col in cols_to_drop if col in global_df.columns]
+        global_df_processed = global_df.drop(columns=cols_to_drop_existing, errors='ignore').copy()
+
+        # Ubah nama kolom menjadi K1, K2, K3, ...
+        if not global_df_processed.empty:
+            new_column_names = {col: f'K{i+1}' for i, col in enumerate(global_df_processed.columns)}
+            global_df_processed = global_df_processed.rename(columns=new_column_names)
+
+        # Menampilkan kerangka data yang dimodifikasi sebagai tabel HTML
+        html_table = df_to_html(global_df_processed, caption="Data setelah Drop Kolom & Rename")
+        return html_table, "Data berhasil diambil dan kolom di-drop/nama diganti.", "" # Menjelaskan status simpan
+
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error mengambil atau memproses data: {e}", f"Error: {e}", None
+
+# Fungsi backend untuk menampilkan semua kolom asli
+def tampilkan_semua_kolom():
+    global global_df
+    if global_df is None:
+        return "Tidak ada data dimuat. Mohon ambil data terlebih dahulu.", "Error: Tidak ada data untuk ditampilkan."
+    try:
+        html_table = df_to_html(global_df, caption="Data Asli")
+        return html_table, "Menampilkan semua kolom asli."
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error menampilkan data asli: {e}", f"Error: {e}"
+
+# Fungsi backend untuk menyimpan data yang ditampilkan ke CSV
+def simpan_data_processed_ke_csv():
+    global global_df_processed
+    if global_df_processed is None:
+        return "Tidak ada data untuk disimpan. Mohon ambil dan proses data terlebih dahulu.", "Error: Tidak ada data untuk disimpan."
+
+    try:
+        csv_filename = 'processed_data_dropped_renamed.csv'
+        global_df_processed.to_csv(csv_filename, index=False)
+        return f"Data yang diproses (setelah drop kolom dan ganti nama) disimpan ke {csv_filename}", "Simpan berhasil."
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error menyimpan data ke CSV: {e}", f"Error: {e}"
+
+# Fungsi backend untuk konversi nilai dropdown ke numerik
+def konversi_nilai_dropdown():
+    global global_df_processed, global_df_numeric, global_feature_cols
+
+    if global_df_processed is None:
+        return "Tidak ada data dimuat atau diproses. Mohon ambil data terlebih dahulu.", "Error: Tidak ada data untuk konversi.", None
+
+    try:
+        global_df_numeric = global_df_processed.copy()
+        # Tentukan pemetaannya
+        mapping = {
+            "Tidak sama sekali": 0,
+            "Sedikit": 1,
+            "Agak": 2,
+            "Sangat": 3
+        }
+
+        # Identifikasi kolom yang dimulai dengan 'K' merupakan respons pertanyaan
+        k_columns = [col for col in global_df_numeric.columns if col.startswith('K')]
+
+        if not k_columns:
+             return "Tidak ada kolom 'K...' yang ditemukan untuk dikonversi.", "Error: Tidak ada kolom 'K'.", None
+
+        for col in k_columns:
+            # Periksa apakah tipe data kolom menunjukkan bahwa kolom tersebut mungkin berisi string
+            if global_df_numeric[col].dtype == 'object' or global_df_numeric[col].dtype == 'string':
+                # Terapkan pemetaan. Nilai yang tidak ada dalam pemetaan akan menjadi NaN.
+                global_df_numeric[col] = global_df_numeric[col].map(mapping)
+                # Konversi ke numerik, kesalahan pemaksaan akan mengubah nilai non-pemetaan (dan NaN dari peta) menjadi NaN
+                global_df_numeric[col] = pd.to_numeric(global_df_numeric[col], errors='coerce')
+            # Gunakan data yang berupa angka, jika potensi tipe campuran maka harus ditetapkan data berupa angka
+
+        # Setelah konversi, kolom K adalah fitur potensial. Simpan nama-namanya.
+        # Hanya kolom yang berupa angka sebagai fitur potensial.
+        numeric_k_columns = global_df_numeric[k_columns].select_dtypes(include=np.number).columns.tolist()
+        global_feature_cols = numeric_k_columns # Store the list of actual numeric feature columns
+
+        html_table = df_to_html(global_df_numeric, caption="Data setelah Konversi Nilai (Kolom 'K...')")
+
+        csv_filename = 'converted_numeric_data.csv'
+        global_df_numeric.to_csv(csv_filename, index=False)
+        save_status = f"Data hasil konversi (Kolom 'K...') disimpan ke {csv_filename}"
+
+        return html_table, f"Konversi nilai jawaban selesai. {save_status}", save_status
+
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error selama konversi: {e}", f"Error: {e}", None
+
+# Fungsi backend untuk melakukan Imputasi (pada data numerik fitur)
+def lakukan_imputasi():
+    global global_df_numeric, global_df_imputed, global_feature_cols, global_imputer
+
+    if global_df_numeric is None or global_df_numeric.empty or global_feature_cols is None or not global_feature_cols:
+        return "Tidak ada data numerik (Kolom 'K...') untuk imputasi. Mohon lakukan konversi terlebih dahulu.", "Error: Tidak ada data untuk imputasi.", None
+
+    try:
+        global_df_imputed = global_df_numeric.copy()
+
+        # Gunakan hanya kolom fitur numerik yang teridentifikasi untuk imputasi
+        df_for_imputation = global_df_imputed[global_feature_cols].copy()
+
+        if df_for_imputation.empty:
+             return "Tidak ada data fitur numerik ('K...') yang tersedia untuk imputasi.", "Error: Tidak ada data fitur.", None
+
+        # Menghitung nilai yang hilang (NaN) - menggunakan mean
+        # Sesuaikan imputer hanya pada kolom fitur
+        global_imputer = SimpleImputer(strategy='mean')
+        # Only apply imputer to the feature columns within global_df_imputed
+        global_df_imputed[global_feature_cols] = global_imputer.fit_transform(df_for_imputation) # Fit and transform
+
+        # Ubah kolom yang diimputasikan kembali menjadi bilangan bulat
+        for col in global_feature_cols:
+            # Gunakan errors='coerce' untuk menangani potensi masalah selama konversi
+            global_df_imputed[col] = global_df_imputed[col].astype(int, errors='ignore')
+
+        html_table = df_to_html(global_df_imputed, caption="Data setelah Imputasi (Kolom 'K...')")
+
+        csv_filename = 'imputed_numeric_data.csv'
+        global_df_imputed.to_csv(csv_filename, index=False)
+        save_status = f"Data hasil imputasi (Kolom 'K...') disimpan ke {csv_filename}"
+
+        return html_table, f"Imputasi selesai. {save_status}", save_status
+
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error selama imputasi: {e}", f"Error: {e}", None
+
+# Fungsi backend untuk melakukan Clustering
+def lakukan_clustering(n_clusters):
+    global global_df_imputed, global_kmeans_model, global_df_clustered, global_scaler, global_feature_cols
+    if global_df_imputed is None or global_df_imputed.empty or global_feature_cols is None or not global_feature_cols:
+        return "Tidak ada data terimputasi (Kolom 'K...') untuk clustering. Mohon lakukan imputasi terlebih dahulu.", "Error: Tidak ada data untuk clustering.", None, None, None
+
+    if n_clusters <= 1:
+        return "Jumlah kluster harus lebih besar dari 1.", "Error: Jumlah kluster tidak valid.", None, None, None
+
+    try:
+        # Gunakan data fitur yang diperhitungkan untuk pengelompokan
+        df_for_clustering = global_df_imputed[global_feature_cols].copy()
+
+        if df_for_clustering.empty:
+            return "Tidak ada data yang tersedia untuk clustering setelah imputasi.", "Error: Tidak ada data fitur.", None, None, None
+
+        # Normalisasikan data sebelum pengelompokan menggunakan MinMaxScaler
+        global_scaler = MinMaxScaler()
+        # Gunakan indeks dari df_for_clustering untuk kerangka data berskala
+        df_scaled = pd.DataFrame(global_scaler.fit_transform(df_for_clustering), columns=global_feature_cols, index=df_for_clustering.index)
+
+        # Melakukan pengelompokan KMeans pada data berskala
+        global_kmeans_model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        global_kmeans_model.fit(df_scaled) # Fit on the scaled data
+
+        # Data imputasi ke penugasan cluster
+        global_df_clustered = global_df_imputed.copy()
+        # Pastikan indeks selaras saat menambahkan label dari KMeans
+        global_df_clustered['Cluster'] = global_kmeans_model.labels_
+
+        # Hitung rata-rata setiap fitur per klaster
+        cluster_means = global_df_clustered.groupby('Cluster')[global_feature_cols].mean()
+
+        # Petakan label cluster ke 'Rendah', 'Sedang', 'Tinggi' jika n_clusters adalah 3
+        cluster_label_mapping = {}
+        if n_clusters == 3:
+            # Urutkan klaster berdasarkan jumlah nilai fitur rata-rata (pada skala asli)
+            cluster_sums = cluster_means.sum(axis=1)
+            sorted_cluster_indices = cluster_sums.argsort()  # Indices sorted by sum
+            labels = ['Rendah', 'Sedang', 'Tinggi']
+            # Membuat pemetaan cluster
+            cluster_label_mapping = {sorted_cluster_indices[i]: labels[i] for i in range(n_clusters)}
+
+            # Kelompokan data pemetaan
+            global_df_clustered['Cluster_Label'] = global_df_clustered['Cluster'].map(cluster_label_mapping)
+
+            # Tambahkan Cluster_Label ke cluster_means dataframe
+            cluster_means['Cluster_Label'] = cluster_means.index.map(cluster_label_mapping)
+            cols = cluster_means.columns.tolist()
+            # Check jika 'Cluster_Label' adalah aktual
+            if 'Cluster_Label' in cols:
+                cols.insert(0, cols.pop(cols.index('Cluster_Label')))
+                cluster_means = cluster_means[cols]
+
+        else:
+            # jika tidak 3 clusters, hanya gunakan label generik 'Kluster_0', 'Kluster_1', ...
+            global_df_clustered['Cluster_Label'] = 'Kluster_' + global_df_clustered['Cluster'].astype(str)
+            cluster_means['Cluster_Label'] = 'Kluster_' + cluster_means.index.astype(str)
+             # penyiapan kolom
+            cols = cluster_means.columns.tolist()
+            # Check if 'Cluster_Label' is actually in cols before trying to move it
+            if 'Cluster_Label' in cols:
+                cols.insert(0, cols.pop(cols.index('Cluster_Label')))
+                cluster_means = cluster_means[cols]
+
+        # Menampilkan kerangka data berkelompok sebagai tabel HTML
+        html_table = df_to_html(global_df_clustered, caption="Data dengan Hasil Clustering (Termasuk Label Kluster)")
+
+        # Simpan data format CSV
+        csv_filename_data = 'clustered_data_with_labels.csv'
+        global_df_clustered.to_csv(csv_filename_data, index=False)
+        save_status_data = f"Data hasil clustering (termasuk label kluster) disimpan ke {csv_filename_data}"
+
+        # Tampilkan Cluster Means
+        means_html = f"<h4>Rata-rata Fitur per Cluster (pada skala asli data):</h4>" + df_to_html(cluster_means, caption=f"Rata-rata Fitur per Kluster")
+
+        # Hasilkan dan simpan Plot Rata-rata Klaster (Plot Batang) - menggunakan cluster_means dataframe
+        fig_means, save_status_plot_means = plot_cluster_means(cluster_means, caption="Rata-rata Fitur per Kluster")
+        plot_html_means = plot_to_html(fig_means, caption=f"Plot Rata-rata Fitur per Kluster", filename='cluster_means_bar_plot.png') if fig_means else save_status_plot_means
+
+        # Hasilkan dan simpan Scatter Plot dari Hasil Clustering (menggunakan dua fitur skala pertama)
+        fig_scatter, save_status_plot_scatter, plot_filename_scatter = plot_clustering_scatter(
+             df_scaled, # Lewatkan data berskala yang digunakan untuk pengelompokan
+             global_df_clustered[['Cluster', 'Cluster_Label']], # Pass only Cluster and Cluster_Label with original index
+             caption=f"Plot Scatter Hasil Clustering (Dua Fitur Terskala Pertama)"
+         )
+        plot_html_scatter = plot_to_html(fig_scatter, caption="Plot Scatter Hasil Clustering (Dua Fitur Terskala Pertama)", filename=plot_filename_scatter) if fig_scatter else save_status_plot_scatter
+
+        results_html = means_html + plot_html_means + plot_html_scatter # Gabungkan tabel mean, mean plot, dan scatter plot HTML
+        save_status_combined = f"{save_status_data}<br>{save_status_plot_means}<br>{save_status_plot_scatter}"
+
+        # Mengembalikan tabel, status, hasil (rata-rata + plot), menggabungkan status penyimpanan, menghapus kesalahan
+        return html_table, f"Clustering selesai dengan {n_clusters} kluster.", results_html, save_status_combined, ""
+
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error selama clustering: {e}", f"Error: {e}", None, None, None
+
+# Fungsi tampilkan_hasil_clustering dan menampilkan plot
+def tampilkan_hasil_clustering():
+    global global_kmeans_model, global_df_clustered, global_df_imputed, global_scaler, global_feature_cols
+
+    if global_kmeans_model is None or global_df_clustered is None or global_df_imputed is None or global_scaler is None or global_feature_cols is None or not global_feature_cols:
+        return "Mohon lakukan clustering terlebih dahulu.", "Error: Tidak ada data clustering.", None, None
+
+    try:
+        # Hitung ulang cluster
+        cluster_means = global_df_clustered.groupby('Cluster')[global_feature_cols].mean()
+
+        # Tambahkan Cluster_Label jika tersedia dan susun ulang kolom
+        if 'Cluster_Label' in global_df_clustered.columns:
+             # Memetakan indeks cluster
+             index_to_label_map = global_df_clustered[['Cluster', 'Cluster_Label']].drop_duplicates().set_index('Cluster')['Cluster_Label'].to_dict()
+             cluster_means['Cluster_Label'] = cluster_means.index.map(index_to_label_map)
+             # Susun ulang untuk menempatkan Cluster_Label
+             cols = cluster_means.columns.tolist()
+             # Pemeriksaan 'Label Cluster'
+             if 'Cluster_Label' in cols:
+                cols.insert(0, cols.pop(cols.index('Cluster_Label')))
+                cluster_means = cluster_means[cols]
+
+        # Tampilkan Cluster Means
+        means_html = "<h4>Rata-rata Fitur per Cluster :</h4>" + df_to_html(cluster_means, caption="Rata-rata Fitur per Kluster")
+
+        # Tampilkan tabel hasil cluster
+        clustered_data_html = "<h4>Data dengan Hasil Clustering:</h4>" + df_to_html(global_df_clustered)
+
+        # Buat Plot Cluster
+        fig_means, save_status_plot_means = plot_cluster_means(cluster_means, caption="Rata-rata Fitur per Kluster")
+        plot_html_means = plot_to_html(fig_means, caption="Plot Rata-rata Fitur per Kluster", filename='cluster_means_bar_plot.png') if fig_means else save_status_plot_means
+
+        # Membuat Scatter Plot, menggunakan data scala
+        df_for_clustering = global_df_imputed[global_feature_cols].copy() # Gunakan data imputasi
+        # Transformasi menggunakkan scaler fitted
+        df_scaled = pd.DataFrame(global_scaler.transform(df_for_clustering), columns=global_feature_cols, index=df_for_clustering.index)
+
+        fig_scatter, save_status_plot_scatter, plot_filename_scatter = plot_clustering_scatter(
+             df_scaled,
+             global_df_clustered[['Cluster', 'Cluster_Label']], # Pass dataframe with Cluster and Cluster_Label with original index
+             caption="Plot Scatter Hasil Clustering (Dua Fitur Terskala Pertama)"
+         )
+        plot_html_scatter = plot_to_html(fig_scatter, caption="Plot Scatter Hasil Clustering (Dua Fitur Terskala Pertama)", filename=plot_filename_scatter) if fig_scatter else save_status_plot_scatter
+
+
+        results_html = means_html + plot_html_means + plot_html_scatter # Combine means table, mean plot, and scatter plot HTML
+
+        return results_html + clustered_data_html, "Hasil clustering ditampilkan.", "" # Return means+plot HTML, status, table HTML, clear error
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error menampilkan hasil clustering: {e}", f"Error: {e}", None
+
+# Fungsi membuat plot_clustering_scatter
+def plot_clustering_scatter(df_scaled, df_cluster_info, caption="Plot Scatter Hasil Clustering (Dua Fitur Terskala Pertama)"):
+    """
+    Creates a scatter plot of clustering results using the first two features
+    from the scaled data, colored by cluster label.
+
+    Args:
+        df_scaled (pd.DataFrame): DataFrame containing the scaled feature data used for clustering.
+                                   Must have at least 2 columns.
+        df_cluster_info (pd.DataFrame): DataFrame with the same index as df_scaled,
+                                       containing 'Cluster' and 'Cluster_Label' columns.
+        caption (str): Title for the plot.
+
+    Returns:
+        tuple: (matplotlib.figure.Figure or None, str, str or None)
+               Returns the matplotlib Figure, a status message (including filename if saved),
+               and the filename where the plot was saved. Returns None and an error message
+               if plotting fails.
+    """
+    if df_scaled is None or df_scaled.empty or df_cluster_info is None or df_cluster_info.empty:
+        return None, "Tidak ada data terskala atau info kluster untuk plot scatter.", None
+
+    if df_scaled.shape[1] < 2:
+        return None, "Data terskala hanya memiliki satu fitur. Tidak dapat membuat plot scatter 2D.", None
+
+    try:
+        # Pastikan indeks cocok antara data berskala dan info klaster
+        if not df_scaled.index.equals(df_cluster_info.index):
+             # Peringatan kesalahan jika gagal
+             print("Warning: Index mismatch between scaled data and cluster info. Attempting to reindex.")
+             # Indeks ulang df_scaled agar sesuai dengan indeks df_cluster_info. Baris yang hilang akan menjadi NaN
+             df_scaled = df_scaled.reindex(df_cluster_info.index)
+             # Hapus baris mana pun yang data berskala atau info klusternya hilang setelah pengindeksan ulang
+             combined_df = pd.concat([df_scaled, df_cluster_info], axis=1).dropna(subset=df_scaled.columns.tolist() + ['Cluster_Label'])
+             if combined_df.empty:
+                  return None, "Setelah menyelaraskan indeks, tidak ada data yang tersisa untuk plot scatter.", None
+             df_scaled = combined_df[df_scaled.columns].copy()
+             df_cluster_info = combined_df[['Cluster', 'Cluster_Label']].copy()
+
+        fig, ax = plt.subplots(figsize=(10, 7))
+
+        # Gunakan dua fitur berskala pertama untuk diagram sebar
+        x_feature = df_scaled.columns[0]
+        y_feature = df_scaled.columns[1]
+
+        # Pastikan indeks df_cluster_info cocok dengan indeks df_scaled untuk pembuatan plot
+        if 'Cluster_Label' in df_cluster_info.columns:
+            sns.scatterplot(
+                x=df_scaled[x_feature],
+                y=df_scaled[y_feature],
+                hue=df_cluster_info['Cluster_Label'], # Gunakan Cluster_Label untuk warna
+                palette='viridis', # Gunakan distinct palette
+                ax=ax,
+                s=50, # Ukuran Marker
+                alpha=0.7
+            )
+            legend_title = 'Kluster Label'
+        else:
+            sns.scatterplot(
+                x=df_scaled[x_feature],
+                y=df_scaled[y_feature],
+                hue=df_cluster_info['Cluster'],
+                palette='viridis',
+                ax=ax,
+                s=50,
+                alpha=0.7
+            )
+            legend_title = 'Kluster'
+
+        ax.set_title(caption)
+        ax.set_xlabel(f'{x_feature} (Scaled)')
+        ax.set_ylabel(f'{y_feature} (Scaled)')
+        ax.legend(title=legend_title, bbox_to_anchor=(1.05, 1), loc='upper left') # Letakan "legend" disamping
+        plt.tight_layout() # Sesuaikan tata letak
+        # simpan plot
+        plot_filename = 'clustering_scatter_plot.png'
+        fig.savefig(plot_filename, bbox_inches='tight') # bbox_inches untuk mencegah labels terpotong
+        save_status = f"Plot scatter hasil clustering disimpan ke {plot_filename}"
+
+        return fig, save_status, plot_filename # Mengembalikan gambar, status, dan nama file
+
+    except Exception as e:
+        traceback.print_exc()
+        return None, f"Error menghasilkan plot scatter: {e}", None
+
+# Fungsi backend untuk pelatihan Naive Bayes
+def latih_naive_bayes():
+    global global_df_clustered, global_model, global_X_test_scaled, global_y_test_encoded, global_imputer, global_scaler, global_feature_cols, global_label_encoder
+
+    # Ensure all necessary global variables are set
+    if global_df_clustered is None or global_df_clustered.empty or global_imputer is None or global_scaler is None or global_feature_cols is None or not global_feature_cols:
+        return "Tidak ada data hasil cluster / preprocessing, mohon lakukan imputasi dan clustering terlebih dahulu.", None, None, None, None, "Error: Data, Scaler, Imputer, atau Feature List belum siap untuk pelatihan."
+
+    # Memastikan clustered data m has the 'Cluster_Label' column
+    if 'Cluster_Label' not in global_df_clustered.columns:
+         return "Kolom target 'Cluster_Label' tidak ditemukan di data clustered, pastikan menghasilkan label kluster.", None, None, None, None, "Error: Kolom target tidak ditemukan."
+
+    try:
+        # Training Naive Bayes
+        X_original_imputed = global_df_clustered[global_feature_cols].copy()
+
+        # Skala menggunakan global_scaler selama clustering
+        X_scaled_array = global_scaler.transform(X_original_imputed) # Use transform, not fit_transform
+        X_scaled = pd.DataFrame(X_scaled_array, columns=global_feature_cols, index=X_original_imputed.index)
+
+        # Ambil variabel target 'Cluster_Label'
+        y_raw = global_df_clustered['Cluster_Label'].copy()
+
+        if X_scaled.empty:
+             return "Tidak ada data fitur (dari data proses sebelumnya) untuk pelatihan.", None, None, None, None, "Error: Data fitur kosong."
+        if y_raw.empty:
+            return "Tidak ada data target ('Cluster_Label').", None, None, None, None, "Error: Data target kosong."
+
+        # Since the target is 'Cluster_Label' (string), we need to encode it for scikit-learn.
+        # Store the encoder to map back predictions later.
+        global_label_encoder = LabelEncoder() # Create/reset encoder
+        y_encoded = global_label_encoder.fit_transform(y_raw)
+        class_names = global_label_encoder.classes_.tolist() # Store original class names
+
+        # Cek jika data / fitur tidak cukup
+        if X_scaled.shape[0] < 2 or X_scaled.shape[1] == 0:
+             return "Data atau fitur tidak cukup setelah diproses untuk pelatihan.", None, None, None, None, "Error: Data atau fitur tidak cukup."
+        # Cek nilai unik di target untuk dipisahkan
+        if len(np.unique(y_encoded)) < 2:
+             return "Kolom target harus memiliki setidaknya dua nilai unik untuk klasifikasi.", None, None, None, None, "Error: Kolom target membutuhkan setidaknya dua kelas."
+
+        # Cek jika kelas unik  untuk stratify split
+        unique_classes_encoded, class_counts = np.unique(y_encoded, return_counts=True)
+
+        stratify_y = None
+        test_size = 0.2 # Default ukuran test 20%
+
+        if (class_counts < 2).any():
+             print("Peringatan: Tidak dapat menggunakan stratify split karena setidaknya satu kelas target hanya memiliki satu sampel. Mencoba non-stratified split.")
+             # Ensure test set has at least 1 sample if possible
+             if X_scaled.shape[0] > 1:
+                  # Adjust test size if necessary to leave at least one sample for training per class (if possible)
+                  # Simple non-stratified split
+                  X_train_scaled, global_X_test_scaled, y_train_encoded, global_y_test_encoded = train_test_split(X_scaled, y_encoded, test_size=test_size, random_state=42)
+             else:
+                 return "Data tidak cukup (hanya 1 sampel) untuk membuat split train/test.", None, None, None, None, "Error: Data tidak cukup untuk split."
+
+        else: # Semua kelas memiliki 2 atau lebih sampel - dapat menggunakan stratifikasi
+             print("Menggunakan stratified split.")
+             stratify_y = y_encoded
+             X_train_scaled, global_X_test_scaled, y_train_encoded, global_y_test_encoded = train_test_split(X_scaled, y_encoded, test_size=test_size, random_state=42, stratify=stratify_y)
+
+
+        # Inisialisasi dan latih model Gaussian Naive Bayes
+        global_model = GaussianNB()
+        global_model.fit(X_train_scaled, y_train_encoded)
+
+        # Lampirkan nama kelas asli ke objek model untuk pengujian/prediksi
+        if hasattr(global_model, 'classes_') and len(global_model.classes_) == len(class_names):
+             global_model.class_names_ = class_names # Store original class names
+
+        # --- Menyiapkan HTML untuk Komponen Naive Bayes (Prior dan Likelihood) ---
+        # Hitung Probabilitas Prior
+        prior_html = "<h4>Probabilitas Prior:</h4>"
+        # Probabilitas prior di GaussianNB sudah dalam bentuk log. Untuk mendapatkan probabilitas aslinya
+        # yang seharusnya tidak lebih dari 1, kita bisa menghitungnya dari jumlah kemunculan kelas di data training.
+        if global_label_encoder and hasattr(global_label_encoder, 'classes_'):
+            # Hitung jumlah kemunculan setiap kelas dalam data training yang dikodekan
+            train_class_counts = pd.Series(y_train_encoded).value_counts().sort_index()
+            total_train_samples = len(y_train_encoded)
+            # Hitung probabilitas prior dari jumlah kemunculan
+            prior_prob = train_class_counts / total_train_samples
+
+            # Buat DataFrame untuk menampilkan
+            prior_df = pd.DataFrame({
+                'Class Label': global_label_encoder.inverse_transform(train_class_counts.index).tolist(), # Use original class names
+                'Encoded Class': train_class_counts.index.tolist(),
+                'Jumlah Sampel Training': train_class_counts.values,
+                'Probabilitas Prior': prior_prob.values
+            })
+            prior_html += df_to_html(prior_df)
+        else:
+             # Fallback jika label encoder tidak tersedia atau tidak sesuai
+             if hasattr(global_model, 'classes_') and hasattr(global_model, 'class_prior_'):
+                 # GaussianNB.class_prior_ adalah log prior probability.
+                 # Menggunakan exp(log_prior) memberikan probabilitas aslinya.
+                 # Probabilitas ini dihitung oleh scikit-learn dari proporsi kelas di data training.
+                 # Jadi seharusnya tidak melebihi 1.
+                 prior_prob_sklearn = np.exp(global_model.class_prior_)
+                 prior_df = pd.DataFrame({
+                     'Encoded Class': global_model.classes_,
+                     'Log Prior (Scikit-learn)': global_model.class_prior_,
+                     'Probabilitas Prior (dari Scikit-learn)': prior_prob_sklearn
+                 })
+                 prior_html += df_to_html(prior_df)
+             else:
+                 prior_html += "<p>Tidak dapat menampilkan detail probabilitas prior.</p>"
+
+
+        # Hitung Likelihood (Mean dan Variance)
+        likelihood_html = "<h4>Likelihood (Mean dan Variance Fitur per Kelas):</h4>"
+        if hasattr(global_model, 'theta_') and hasattr(global_model, 'var_') and hasattr(global_model, 'classes_') and hasattr(global_model, 'class_names_') and global_feature_cols:
+            # Ambil nama fitur dari training data (X_scaled)
+            feature_names = global_feature_cols # Gunakan fitur dikirimkan ke data
+
+            # Buat kamus untuk menyimpan informasi kemungkinan
+            likelihood_data = {}
+            # Yakinkan kesesuaian dimensi : theta_ is (n_classes, n_features), var_ is (n_classes, n_features)
+            if global_model.theta_.shape == (len(global_model.classes_), len(feature_names)) and \
+               global_model.var_.shape == (len(global_model.classes_), len(feature_names)):
+
+                for i, class_name in enumerate(global_model.class_names_): # Gunakan nama kela asli
+                    likelihood_data[f'Kelas: {class_name} (Encoded: {global_model.classes_[i]})'] = {}
+                    for j, feature_name in enumerate(feature_names):
+                        mean_val = global_model.theta_[i, j]
+                        var_val = global_model.var_[i, j]
+                        # Mean and variance adalah skala data SCALED
+                        likelihood_data[f'Kelas: {class_name} (Encoded: {global_model.classes_[i]})'][feature_name] = f'Mean(Scaled)={mean_val:.4f}, Variance(Scaled)={var_val:.4f}'
+
+                likelihood_text = ""
+                for class_name_info, features_data in likelihood_data.items():
+                    likelihood_text += f"**{class_name_info}:**\n"
+                    for feature_name, stats in features_data.items():
+                        likelihood_text += f"  - {feature_name}: {stats}\n"
+                likelihood_html += f"<pre>{likelihood_text}</pre>"
+            else:
+                 likelihood_html += "<p>Dimensi Mean/Variance model tidak sesuai dengan fitur.</p>"
+
+        else:
+            likelihood_html += "<p>Detail Likelihood (Mean/Variance) tidak tersedia untuk model.</p>"
+
+        # Posterior probability is calculated during prediction.
+        posterior_html = "<h4>Probabilitas Posterior:</h4><p>Probabilitas posterior dihitung selama prediksi untuk data baru (lihat tab 5).</p>"
+        bayes_results_html = prior_html + likelihood_html + posterior_html
+
+        # --- Save Components ---
+
+        # Simpan data pelatihan dalam format CSV
+        X_train_original_imputed = global_df_clustered.loc[X_train_scaled.index, global_feature_cols].copy()
+        train_df = X_train_original_imputed.copy()
+        # Tambahkan kolom target
+        train_df['Target_Encoded'] = y_train_encoded
+        # Tambahakan label target asli menggunakan encoder
+        if global_label_encoder:
+             train_df['Target_Label'] = global_label_encoder.inverse_transform(y_train_encoded)
+        # Tambahkan kolom 'Cluster' asli dari global_df_clustered berdasarkan indeks (optional)
+        if 'Cluster' in global_df_clustered.columns:
+             train_df['Original_Cluster'] = global_df_clustered.loc[X_train_scaled.index, 'Cluster']
+
+        train_csv_filename = 'training_data_with_labels.csv'
+        train_df.to_csv(train_csv_filename, index=True) # Keep index to link back to original data if needed
+        save_status_train_data = f"Data training (imputed original + labels) disimpan ke {train_csv_filename}",
+
+        # Simpan Model, Scaler, Imputer, dan Label Encoder -
+        model_filename = 'naive_bayes_model.joblib'
+        joblib.dump(global_model, model_filename)
+        save_status_model = f"Model Naive Bayes disimpan ke {model_filename}",
+
+        scaler_filename = 'minmax_scaler.joblib'
+        joblib.dump(global_scaler, scaler_filename)
+        save_status_scaler = f"MinMaxScaler disimpan ke {scaler_filename}",
+
+        imputer_filename = 'simple_imputer.joblib'
+        joblib.dump(global_imputer, imputer_filename)
+        save_status_imputer = f"SimpleImputer disimpan ke {imputer_filename}",
+
+        if global_label_encoder:
+             encoder_filename = 'label_encoder.joblib'
+             joblib.dump(global_label_encoder, encoder_filename)
+             save_status_encoder = f"LabelEncoder disimpan ke {encoder_filename}",
+        else:
+             save_status_encoder = "LabelEncoder tidak disimpan karena target tidak dikonversi atau ada error."
+
+        save_status_combined = f"{save_status_train_data}<br>{save_status_model}</br><br>{save_status_scaler}</br><br>{save_status_imputer}</br><br>{save_status_encoder}</br>"
+
+        # pengembalian, jumlah sampel uji, jumlah sampel kereta, komponen HTML Naive Bayes, gabungan status penyimpanan, penghapusan kesalahan
+        return "Model Naive Bayes berhasil dilatih.", global_X_test_scaled.shape[0], X_train_scaled.shape[0], bayes_results_html, save_status_combined, ""
+
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error melatih model Naive Bayes: {e}", None, None, None, None, f"Error: {e}"
+
+# Fungsi backend untuk pengujian model
+def uji_model():
+    global global_model, global_X_test_scaled, global_y_test_encoded, global_label_encoder
+
+    # Yakinkan model dan data test tersedia
+    if global_model is None or global_X_test_scaled is None or global_y_test_encoded is None:
+        return "Mohon latih model Naive Bayes terlebih dahulu.", "Error: Model atau data test belum siap.", None
+
+    # Yakinkan data test tidak kosong
+    if global_X_test_scaled.empty or global_y_test_encoded.shape[0] == 0:
+        return "Tidak ada data uji yang tersedia untuk menguji model.", "Error: Tidak ada data uji.", None
+
+    try:
+        y_pred_encoded = global_model.predict(global_X_test_scaled)
+        # Dekode label yang diprediksi dan benar kembali ke string asli menggunakan encoder yang tersimpan
+        if global_label_encoder and hasattr(global_label_encoder, 'classes_'):
+            # Dapatkan semua kemungkinan nama kelas asli dari encoder (proses training)
+            all_original_class_names = global_label_encoder.classes_.tolist()
+
+            # Dekode label yang dikodekan benar dan yang diprediksi
+            y_test_decoded = global_label_encoder.inverse_transform(global_y_test_encoded)
+            y_pred_decoded = global_label_encoder.inverse_transform(y_pred_encoded)
+
+            # classification_report, gunakan semua kemungkinan nama kelas seabgai target_names
+            report_target_names = all_original_class_names
+
+            # Untuk confusion_matrix, gunakan encoded labels
+            matrix_labels_encoded = global_model.classes_.tolist() # Encoded labels the model knows
+            matrix_labels_decoded = global_label_encoder.inverse_transform(matrix_labels_encoded).tolist() # Corresponding original labels
+        else:
+            # Fallback: Jika tidak ada encoder, gunakan label yang dikodekan (numerik)
+            y_test_decoded = global_y_test_encoded
+            y_pred_decoded = y_pred_encoded
+            # Tentukan semua label numerik unik yang ada dalam set pengujian benar dan terprediksi
+            unique_test_labels = np.unique(global_y_test_encoded).tolist()
+            unique_pred_labels = np.unique(y_pred_encoded).tolist()
+            # Gunakan semua label unik yang ditemukan dalam pengujian/prediksi untuk laporan dan matriks
+            all_unique_test_pred_labels = sorted(list(set(unique_test_labels).union(set(unique_pred_pred_labels))))
+
+            report_target_names = [str(int(i)) for i in all_unique_test_pred_labels] # Gunaka string pada numbers
+            matrix_labels_encoded = all_unique_test_pred_labels # Gunakan numeric labels untuk menghitung matrix
+            matrix_labels_decoded = report_target_names # Gunakan string untuk menampilkan labels
+
+
+        # Hitung laporan classification menggunakan decoded labels dan nama target spesifik.
+        # Gunakan zero_division=0 untuk menangani kasus dimana kelas tidak sesuai atau bkak sampel prediksi
+        classification_rep = classification_report(y_test_decoded, y_pred_decoded, target_names=report_target_names, zero_division=0)
+
+        # Hitung confusion matrix menggunakan ENCODED test/predicted values
+        confusion_mat = confusion_matrix(global_y_test_encoded, y_pred_encoded, labels=matrix_labels_encoded)
+
+        # Hitung akurasi score menggunakan label decoded labels
+        accuracy = accuracy_score(y_test_decoded, y_pred_decoded)
+
+        # Penentuan format tampilan Confusion Matrix
+        confusion_matrix_df = pd.DataFrame(confusion_mat, index=matrix_labels_decoded, columns=matrix_labels_decoded)
+
+        # Konfersi DataFrame ke HTML
+        confusion_matrix_html = "<h4>Confusion Matrix:</h4>"
+        confusion_matrix_html += df_to_html(confusion_matrix_df)
+
+        results_html = f"<h4>Hasil Pengujian:</h4>"
+        results_html += f"<p><b>Akurasi:</b> {accuracy:.4f}</p>"
+        results_html += "<h4>Classification Report:</h4>"
+        results_html += f"<pre>{classification_rep}</pre>"
+        results_html += confusion_matrix_html #
+
+        # Simpan hasil pengujian data test selama pembelajaran
+        test_results_filename = "test_results.html" # Simpan sebagai format HTML
+        with open(test_results_filename, "w") as f:
+            f.write(results_html)
+        save_status = f"Hasil uji model (HTML) disimpan ke {test_results_filename}"
+
+        return results_html, "", save_status # Mengembalikan hasil HTML, clear error, and save status
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error selama pengujian model: {e}", f"Error: {e}", None
+
+# Fungsi backend untuk menguji model dengan data baru
+# Modifikasi fungsi prediksi_data_baru untuk memeriksa apakah semua input diisi
+def prediksi_data_baru(k1, k2, k3, k4, k5, k6, k7, k8, k9, k10,
+                       k11, k12, k13, k14, k15, k16, k17, k18, k19, k20):
+    global global_model, global_imputer, global_scaler, global_feature_cols, global_label_encoder
+
+    # Periksa apakah semua input diisi (tidak None)
+    input_values_list = [k1, k2, k3, k4, k5, k6, k7, k8, k9, k10,
+                         k11, k12, k13, k14, k15, k16, k17, k18, k19, k20]
+    if None in input_values_list:
+        error_message = "Data wajib diisi semua. Mohon lengkapi semua jawaban kuesioner."
+        return f"<p style='color:red;'>{error_message}</p>", error_message, "N/A", "N/A", "N/A"
+
+    # Yakinkan model dan komponen preprocessing tersedia
+    if global_model is None or global_imputer is None or global_scaler is None or global_feature_cols is None or not global_feature_cols:
+        return "Mohon latih model Naive Bayes (termasuk proses Preprocessing dan Clustering) terlebih dahulu.", "Error: Model atau komponen pra-pemrosesan belum siap.", None, None, None
+
+    try:
+        # Buat DataFrame
+        input_values = {
+            'K1': k1, 'K2': k2, 'K3': k3, 'K4': k4, 'K5': k5,
+            'K6': k6, 'K7': k7, 'K8': k8, 'K9': k9, 'K10': k10,
+            'K11': k11, 'K12': k12, 'K13': k13, 'K14': k14, 'K15': k15,
+            'K16': k16, 'K17': k17, 'K18': k18, 'K19': k19, 'K20': k20
+        }
+        new_df = pd.DataFrame([input_values])
+
+        # Yakinkan data pada DataFrame memiliki nilai sama
+        if not global_feature_cols:
+             return "Error: Tidak ada kolom fitur yang terdeteksi dari data training.", "Error: Tidak ada fitur training.", None, None, None
+        # Pilih kolom fitur untuk model dan indeks ulang
+        new_df_processed = new_df[global_feature_cols].copy()
+
+        # --- Aplikasikan langkah preprocessing pada training data ---
+
+        # 1. konfersikan pemetaan nilai
+        mapping = {
+            "Tidak sama sekali": 0, "Sedikit": 1, "Agak": 2, "Sangat": 3
+        }
+        # Aplikasikan pemetaan
+        cols_to_convert = new_df_processed.select_dtypes(exclude=np.number).columns.tolist()
+
+        for col in cols_to_convert:
+             # Yakinkan kolom fitur sebelum dipetakan
+             if col in new_df_processed.columns:
+                 # Apply map, keep original if not in map, then convert to numeric (coercing errors)
+                 new_df_processed[col] = new_df_processed[col].map(mapping)
+                 new_df_processed[col] = pd.to_numeric(new_df_processed[col], errors='coerce')
+
+        # 2. Nilai Impute missing  (NaNs) menggunakan *fitted* global_imputer
+        if global_imputer is None:
+             return "Imputer tidak ditemukan. Mohon latih model terlebih dahulu.", "Error: Imputer hilang.", None, None, None
+
+        # Aplikasikan transformasi menggunakan fitted imputer
+        new_df_imputed_array = global_imputer.transform(new_df_processed[global_feature_cols])
+        new_df_imputed = pd.DataFrame(new_df_imputed_array, columns=global_feature_cols, index=new_df_processed.index)
+
+        # 3. Skala data menggunakan *fitted* global_scaler
+        if global_scaler is None:
+             return "Scaler tidak ditemukan. Mohon lakukan clustering terlebih dahulu.", "Error: Scaler hilang.", None, None, None
+
+        # Aplikasikan transformasi menggunakan fitted global_scaler
+        new_df_scaled_array = global_scaler.transform(new_df_imputed)
+        new_df_scaled = pd.DataFrame(new_df_scaled_array, columns=global_feature_cols, index=new_df_imputed.index)
+
+        if new_df_scaled.empty or new_df_scaled.shape[1] != len(global_feature_cols):
+            return "Error: Data baru yang diproses dan terskala tidak sesuai dengan format fitur yang diharapkan untuk prediksi.", "Error: Data baru diproses tidak sesuai.", None, None, None
+
+        # Buat prediksi pada SCALED data
+        predictions_encoded = global_model.predict(new_df_scaled)
+
+        # Ambil estimasi probabilitas untuk beberapa kelas pada data SCALED
+        prediction_proba = global_model.predict_proba(new_df_scaled)
+
+        # Jika kolom target kategori ('Cluster_Label'), konfersikan kembali prediksi untuk label original
+        predicted_label = "N/A"
+        posterior_probs_str = "Tidak dapat menghitung probabilitas posterior."
+        prediction_category = "N/A" # Added for category output
+
+        if len(predictions_encoded) > 0:
+             encoded_prediction = predictions_encoded[0]
+             if global_label_encoder and hasattr(global_label_encoder, 'classes_'):
+                  # Gunakan encoder label yang tersimpan untuk memetakan prediksi yang dikodekan kembali ke label asli
+                  if 0 <= int(encoded_prediction) < len(global_label_encoder.classes_):
+                      predicted_label = global_label_encoder.inverse_transform([encoded_prediction])[0]
+                      prediction_category = predicted_label # Use the predicted label as the category
+                  else:
+                      predicted_label = f"Unknown_Encoded_{encoded_prediction}"
+                      prediction_category = "Unknown (Encoded Value)"
+             else:
+                  # Tetapkan sebagai numerik jika target numerik
+                  predicted_label = str(encoded_prediction)
+                  prediction_category = f"Encoded Numeric ({predicted_label})"
+
+             # Format probabilitas posterior
+             if prediction_proba.shape[0] > 0 and global_model.classes_ is not None and prediction_proba.shape[1] == len(global_model.classes_):
+                 posterior_probs = prediction_proba[0] # Asumsikan baris pertama pada data baru
+                 # Gunakan kelas asli dari encoder untuk label probabilitas jika tersedia, selain itu gunakan angka encoded
+                 prob_labels = global_label_encoder.classes_.tolist() if global_label_encoder and hasattr(global_label_encoder, 'classes_') else [str(int(c)) for c in global_model.classes_]
+
+                 if len(prob_labels) == len(posterior_probs):
+                     # Buat kamus pemetaan label untuk probabilitas
+                     prob_dict = dict(zip(prob_labels, posterior_probs))
+                     # Urutkan berdasarkan probabilitas dalam descending
+                     sorted_probs = sorted(prob_dict.items(), key=lambda item: item[1], reverse=True)
+                     # Format dalam setring
+                     posterior_probs_str = ", ".join([f"{label}: {prob:.4f}" for label, prob in sorted_probs])
+                 else:
+                     posterior_probs_str = "Jumlah probabilitas tidak cocok dengan jumlah kelas."
+             else:
+                  posterior_probs_str = "Probabilitas posterior tidak tersedia atau format tidak sesuai."
+
+
+        # Buat hasil DataFrame kombinasi input dan prediction/probabilities untuk ditampilkan
+        result_df_display = new_df.copy() # Use the dataframe with original input values
+        result_df_display['Label Prediksi'] = predicted_label
+        result_df_display['Kategori Hasil'] = prediction_category # Added category column
+        result_df_display['Probabilitas Posterior'] = posterior_probs_str
+
+        # Tampilkan data baru dengan prediksi
+        html_output = df_to_html(result_df_display, caption="Hasil Prediksi Data Baru")
+
+        # Persiapkan data untuk penyimpanan (termasuk input and hasil prediksi)
+        prediction_results_df = new_df.copy() # Start with original input
+        prediction_results_df['Label Prediksi'] = predicted_label
+        prediction_results_df['Kategori Hasil'] = prediction_category
+        prediction_results_df['Probabilitas Posterior'] = posterior_probs_str
+
+        prediction_results_csv_filename = 'new_data_prediction_results.csv'
+        prediction_results_df.to_csv(prediction_results_csv_filename, index=False)
+        save_status = f"Hasil prediksi data baru disimpan ke {prediction_results_csv_filename}"
+
+        # Mengembalikan output HTML, pesan status, label yang diprediksi, kategori yang diprediksi, string probabilitas posterior
+        return html_output, f"Prediksi selesai. {save_status}", predicted_label, prediction_category, posterior_probs_str
+
+    except Exception as e:
+        traceback.print_exc()
+        return f"Error memprediksi data baru: {e}", f"Error: {e}", None, None, None
+
+# --- Gradio Interfaces ---
+
+# Interface 1: Mengambil Data, Drop, Rename, Konversi, Imputasi
+with gr.Blocks() as interface_preprocessing:
+    gr.Markdown("<h2>1. Pengambilan & Pra-pemrosesan Data</h2>")
+    gr.Markdown("Langkah ini meliputi: Ambil data dari Google Sheet, buang kolom pribadi, ubah nama kolom data menjadi K1, K2, ..., konversi nilai jawaban kuesioner ke angka (0-3), dan lakukan imputasi missing values.")
+
+    with gr.Row():
+        ambil_data_btn = gr.Button("Ambil Data & Proses Awal")
+        tampilkan_semua_kolom_btn = gr.Button("Tampilkan Semua Kolom Asli")
+        simpan_processed_csv_btn = gr.Button("Simpan Data Drop/Rename ke CSV")
+
+    output_table_processed = gr.HTML(label="Data setelah Drop Kolom & Rename")
+    output_status_data_processed = gr.Textbox(label="Status Data", interactive=False)
+    output_simpan_processed_csv = gr.Textbox(label="Status Simpan CSV (Drop/Rename)", interactive=False)
+
+    ambil_data_btn.click(fn=ambil_data_dan_tampilkan_dan_drop, inputs=None, outputs=[output_table_processed, output_status_data_processed, output_simpan_processed_csv])
+    tampilkan_semua_kolom_btn.click(fn=tampilkan_semua_kolom, inputs=None, outputs=[output_table_processed, output_status_data_processed])
+    simpan_processed_csv_btn.click(fn=simpan_data_processed_ke_csv, inputs=None, outputs=[output_simpan_processed_csv, output_status_data_processed])
+
+    gr.Markdown("---")
+    gr.Markdown("<h4>Konversi Nilai Jawaban ke Numerik</h4>")
+    gr.Markdown("Jawaban 'Tidak sama sekali' -> 0, 'Sedikit' -> 1, 'Agak' -> 2, 'Sangat' -> 3.")
+    konversi_btn = gr.Button("Lakukan Konversi Nilai Jawaban")
+    output_table_numeric = gr.HTML(label="Data setelah Konversi Nilai (Kolom 'K...')")
+    output_status_konversi = gr.Textbox(label="Status Konversi", interactive=False)
+    output_simpan_konversi = gr.Textbox(label="Status Simpan CSV (Konversi)", interactive=False)
+
+    konversi_btn.click(fn=konversi_nilai_dropdown, inputs=None, outputs=[output_table_numeric, output_status_konversi, output_simpan_konversi])
+
+    gr.Markdown("---")
+    gr.Markdown("<h4>Imputasi Data (mengisi nilai yang kosong dengan rata-rata kolom)</h4>")
+    gr.Markdown("Dilakukan pada kolom-kolom numerik hasil konversi ('K...').")
+    imputasi_btn = gr.Button("Lakukan Imputasi")
+    output_table_imputed = gr.HTML(label="Data setelah Imputasi (Kolom 'K...')")
+    output_status_imputasi = gr.Textbox(label="Status Imputasi", interactive=False)
+    output_simpan_imputasi = gr.Textbox(label="Status Simpan CSV (Imputasi)", interactive=False)
+
+    imputasi_btn.click(fn=lakukan_imputasi, inputs=None, outputs=[output_table_imputed, output_status_imputasi, output_simpan_imputasi])
+
+# Interface 2: Clustering
+with gr.Blocks() as interface_clustering:
+    gr.Markdown("<h2>2. Lakukan Clustering (pada Data Terimputasi)</h2>")
+    gr.Markdown("Clustering dilakukan pada data yang telah diimputasi dan **diskalakan sementara** untuk proses clustering. Jumlah kluster yang umum untuk analisis kecemasan adalah 3 (Rendah, Sedang, Tinggi), namun Anda dapat mencoba jumlah lain.")
+    input_n_clusters = gr.Slider(minimum=2, maximum=10, value=3, step=1, label="Jumlah Kluster")
+    with gr.Row():
+        cluster_btn = gr.Button("Lakukan Clustering")
+    gr.Markdown("Hasil clustering (data dengan label kluster, rata-rata per kluster, dan plot) akan ditampilkan dan disimpan.")
+
+    output_status_clustering = gr.Textbox(label="Status Clustering", interactive=False)
+    output_clustering_results = gr.HTML(label="Hasil Analisis Clustering (Rata-rata & Plot)")
+    output_table_clustered = gr.HTML(label="Data dengan Hasil Clustering (Termasuk Label Kluster)")
+    output_clustering_save_status = gr.Textbox(label="Status Simpan Hasil Clustering", interactive=False)
+    output_clustering_error = gr.Textbox(label="Error Info", interactive=False)
+
+    cluster_btn.click(
+        fn=lakukan_clustering,
+        inputs=input_n_clusters,
+        outputs=[output_table_clustered, output_status_clustering, output_clustering_results, output_clustering_save_status, output_clustering_error]
+    )
+
+# Interface 3: Pelatihan Naive Bayes
+with gr.Blocks() as interface_latih_model:
+    gr.Markdown("<h2>3. Latih Model Naive Bayes</h2>")
+    gr.Markdown("Latih model Naive Bayes menggunakan data yang telah diimputasi dan **diskalakan** (dari proses clustering) sebagai fitur, dengan 'Cluster_Label' sebagai kolom target (hasil dari clustering).")
+    latih_btn = gr.Button("Latih Model dengan 'Cluster_Label' sebagai Target")
+    output_status_pelatihan = gr.Textbox(label="Status Pelatihan", interactive=False)
+    output_jumlah_test = gr.Number(label="Jumlah Data Test", interactive=False)
+    output_jumlah_train = gr.Number(label="Jumlah Data Train", interactive=False)
+    output_bayes_details = gr.HTML(label="Detail Model (Prior, Likelihood)")
+    output_pelatihan_save_status = gr.Textbox(label="Status Simpan Data Training & Model", interactive=False)
+    output_latih_error = gr.Textbox(label="Error Info", interactive=False)
+
+    latih_btn.click(
+        fn=latih_naive_bayes,
+        inputs=None,
+        outputs=[output_status_pelatihan, output_jumlah_test, output_jumlah_train, output_bayes_details, output_pelatihan_save_status, output_latih_error]
+    )
+
+# Interface 4: Pengujian Model
+with gr.Blocks() as interface_uji_model:
+    gr.Markdown("<h2>4. Pengujian Model</h2>")
+    gr.Markdown("Klik 'Uji Model' untuk menguji model Naive Bayes yang telah dilatih menggunakan data test yang dipisahkan (20% dari data latih) dan menampilkan metrik evaluasi.")
+    uji_btn = gr.Button("Uji Model")
+    # Rubah tipe output ke HTML untuk ditampilkan pada tabel confusion matrix
+    output_hasil_uji = gr.HTML(label="Hasil Pengujian (Accuracy, Classification Report, Confusion Matrix)")
+    output_uji_error = gr.Textbox(label="Error Info", interactive=False)
+    output_uji_save_status = gr.Textbox(label="Status Simpan Hasil Uji", interactive=False)
+
+    uji_btn.click(fn=uji_model, inputs=None, outputs=[output_hasil_uji, output_uji_error, output_uji_save_status])
+
+# Interface 5: Prediksi Data Baru
+with gr.Blocks() as interface_prediksi_baru:
+    gr.Markdown("<h2>5. Prediksi Data Baru</h2>")
+    gr.Markdown("Isikan jawaban Anda untuk pertanyaan Kuesioner 1 (K1) hingga Kuesioner 20 (K20) menggunakan tombol pilihan berikut:")
+    gr.Markdown("Pilih salah satu dari opsi ini untuk setiap kuesioner:")
+    gr.Markdown("<ul><li>Tidak sama sekali</li><li>Sedikit</li><li>Agak</li><li>Sangat</li></ul>")
+
+    # Buat "button check list" untuk input jawaban dari K1 ke K20
+    input_k_list = []
+    choices = ["Tidak sama sekali", "Sedikit", "Agak", "Sangat"]
+    questions = {
+        'K1': 'Apakah anda ada perasaan gelisah atau tegang sebelum UAS ?',
+        'K2': 'Apakah anda merasa gugup atau khawatir setiap menghadapi UAS ?',
+        'K3': 'Apakah anda biasanya sulit untuk tenang atau rileks pada saat sebelum dan sesudah UAS ?',
+        'K4': 'Apakah sebelum UAS berlangsung kesulitan untuk tidur atau tidur terasa terganggu, sebelum UAS ?',
+        'K5': 'Apakah anda sangat cemas tentang masa depan, jika anda mengalami kegagalan dalam mengerjakan UAS ?',
+        'K6': 'Apakah anda sangat mudah tersinggung atau marah jika gagal dalam menyelesaikan soal UAS ?',
+        'K7': 'Apakah anda merasa tidak mampu untuk berkonsentrasi atau memusatkan perhatian pada saat mengerjakan soal UAS ?',
+        'K8': 'Apakah anda tidak bisa menenangkan diri sendiri, jika pada saat UAS ada permasalahan yang mengganggu pikiran anda ?',
+        'K9': 'Apakah anda memiliki perasaan cemas yang konstan atau berlebihan pada saat anda tidak siap dengan UAS ?',
+        'K10': 'Apakah tubuh anda terasa tegang atau kaku, pada saat sebelum ataupun saat mengerjakan UAS?',
+        'K11': 'Apakah adanda merasa khawatir tentang berbagai hal yang mungkin terjadi, jika anda gagal tidak mengikuti UAS atau merasa hasil yang dikerjakan tidak dapat diselesaikan ?',
+        'K12': 'Apakah anda merasa cemas atau takut tanpa alasan yang jelas, sebelum ataupun menjelang UAS?',
+        'K13': 'Apakah anda merasa sulit untuk menenangkan pikiran, jika ada hal yang mengganggu pikiran dan perasaan pada saat mengerjakan UAS ?',
+        'K14': 'Apakah anda merasa takut akan hal-hal yang tidak anda mengerti, pada saat mengerjakan soal tidak seperti yang dipelajari ?',
+        'K15': 'Apakah anda tergolong tipe sulit untuk mengekspresikan perasaan anda sendiri didepan orang?',
+        'K16': 'Apakah anda merasa sulit untuk bertindak tegas atau membuat keputusan saat menghadapi UAS?',
+        'K17': 'Apakah anda khawatir berlebihan tentang detail kecil sebelum UAS?',
+        'K18': 'Apakah anda cenderung menghindari situasi yang memicu kecemasan sebelum UAS?',
+        'K19': 'Apakah anda sering merasa jantung berdebar atau sesak napas sebelum UAS?',
+        'K20': 'Apakah anda merasa lelah atau kehabisan energi karena khawatir tentang UAS?'
+    }
+
+    # Gunakan kolom tersusun vertikal untuk meng-input-kan dari K1-K20
+    with gr.Column():
+        # Buat input secara dinamik
+        if global_feature_cols:
+            pred_input_cols = global_feature_cols
+        else:
+            pred_input_cols = [f'K{i}' for i in range(1, 21)]
+
+        for col in pred_input_cols:
+            question_text = questions.get(col, f'Pertanyaan {col}')
+            input_k_list.append(gr.Radio(label=f"{col}: {question_text}", choices=choices, value=None, interactive=True))
+
+    prediksi_btn = gr.Button("Lakukan Prediksi")
+    output_prediksi_data_baru = gr.HTML(label="Hasil Prediksi Data Baru")
+    output_prediksi_error = gr.Textbox(label="Error Info", interactive=False)
+    output_predicted_label = gr.Textbox(label="Label Prediksi", interactive=False)
+    output_predicted_category = gr.Textbox(label="Kategori Hasil", interactive=False)
+    output_predicted_probs = gr.Textbox(label="Probabilitas Posterior per Kategori", interactive=False)
+
+    prediksi_btn.click(
+        fn=prediksi_data_baru,
+        inputs=input_k_list,
+        outputs=[output_prediksi_data_baru, output_prediksi_error, output_predicted_label, output_predicted_category, output_predicted_probs]
+    )
+
+# Menggabungkan semua interface menggunakan Blocks
+with gr.Blocks() as demo:
+    gr.Markdown("<h1>Aplikasi Prediksi Tingkat Kecemasan Mahasiswa menghadapi Ujian dengan Naive Bayes dan Clustering</h1>")
+    gr.Markdown("Lakukan Proses berurutan dari tab 1 hingga 5 untuk memproses data, melatih model, dan melakukan prediksi.")
+
+    with gr.Tab("1. Pengambilan & Pra-pemrosesan Data"):
+        interface_preprocessing.render()
+
+    with gr.Tab("2. Clustering"):
+        interface_clustering.render()
+
+    with gr.Tab("3. Latih Model Naive Bayes"):
+        interface_latih_model.render()
+
+    with gr.Tab("4. Uji Model"):
+        interface_uji_model.render()
+
+    with gr.Tab("5. Prediksi Data Baru"):
+        interface_prediksi_baru.render()
+
+
+# Jalankan demo
+demo.launch(share=True, debug=False)
+
+
+
+
+
